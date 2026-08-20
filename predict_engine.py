@@ -83,7 +83,15 @@ class PredictEngine:
     # Model Loading
     # ------------------------------------------------------------------
     def _load_model(self):
-        """Load long (v4.1) and short (v5) classification + regression models."""
+        """Load long (v4.1) and short (v5) classification + regression models.
+
+        Each .pkl is a dict containing a full training bundle:
+        {'model_long', 'model_short', 'reg_long', 'reg_short', 'features',
+         'auc_long', 'auc_short', ['version']}
+        The v4 file's usable half is model_long/reg_long; the v5 file's
+        usable half is model_short/reg_short. The other half in each file
+        is a leftover from that training run and is intentionally ignored.
+        """
         long_path = MODEL_DIR / 'stock_model_v4.pkl'
         short_path = MODEL_DIR / 'stock_model_v5.pkl'
 
@@ -91,11 +99,22 @@ class PredictEngine:
             with open(long_path, 'rb') as f:
                 data = pickle.load(f)
             if isinstance(data, dict):
-                self.model_long = data.get('classifier') or data.get('model')
-                self.reg_long = data.get('regressor')
+                self.model_long = data.get('model_long')
+                self.reg_long = data.get('reg_long')
+                self._check_feature_list('long', data.get('features'), FEATURES_LONG)
+                if self.model_long is None:
+                    logger.error(
+                        "Long model file loaded but 'model_long' key missing/empty. "
+                        "Keys found: %s", list(data.keys())
+                    )
+                else:
+                    logger.info(
+                        "Loaded long model (v4.1) from %s (auc_long=%s)",
+                        long_path, data.get('auc_long')
+                    )
             else:
                 self.model_long = data
-            logger.info("Loaded long model (v4.1) from %s", long_path)
+                logger.info("Loaded long model (v4.1) from %s", long_path)
         else:
             logger.warning("Long model not found: %s", long_path)
 
@@ -103,13 +122,41 @@ class PredictEngine:
             with open(short_path, 'rb') as f:
                 data = pickle.load(f)
             if isinstance(data, dict):
-                self.model_short = data.get('classifier') or data.get('model')
-                self.reg_short = data.get('regressor')
+                self.model_short = data.get('model_short')
+                self.reg_short = data.get('reg_short')
+                self._check_feature_list('short', data.get('features'), FEATURES_SHORT)
+                if self.model_short is None:
+                    logger.error(
+                        "Short model file loaded but 'model_short' key missing/empty. "
+                        "Keys found: %s", list(data.keys())
+                    )
+                else:
+                    logger.info(
+                        "Loaded short model (v5) from %s (auc_short=%s)",
+                        short_path, data.get('auc_short')
+                    )
             else:
                 self.model_short = data
-            logger.info("Loaded short model (v5) from %s", short_path)
+                logger.info("Loaded short model (v5) from %s", short_path)
         else:
             logger.warning("Short model not found: %s", short_path)
+
+    @staticmethod
+    def _check_feature_list(label: str, saved_features, expected_features: List[str]):
+        """Warn if the feature list baked into the pkl doesn't match the code's list."""
+        if saved_features is None:
+            return
+        saved_list = list(saved_features)
+        if saved_list != expected_features:
+            logger.warning(
+                "%s model: feature list in pkl does NOT match FEATURES_%s in code. "
+                "This can cause silent misprediction (columns get misaligned). "
+                "pkl has %d features, code has %d. "
+                "pkl-only: %s | code-only: %s",
+                label, label.upper(), len(saved_list), len(expected_features),
+                [f for f in saved_list if f not in expected_features],
+                [f for f in expected_features if f not in saved_list],
+            )
 
     # ------------------------------------------------------------------
     # Stock Info
@@ -504,10 +551,48 @@ class PredictEngine:
     def get_existing_predictions(self, date_str: str) -> Optional[Dict]:
         """Get existing predictions for a date."""
         path = self._get_history_path(date_str)
+        data = None
         if path.exists():
             with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return None
+                data = json.load(f)
+        else:
+            # Old format: predict_YYYYMMDD.json
+            date_compact = date_str.replace('-', '')
+            old_path = PREDICTION_HISTORY_DIR / f'predict_{date_compact}.json'
+            if old_path.exists():
+                with open(old_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+        if data is None:
+            return None
+
+        # Normalize old format to new format
+        if 'long_top10' not in data and 'long' in data:
+            long_list = []
+            for item in data.get('long', []):
+                long_list.append({
+                    'stock_id': item.get('stock_id', ''),
+                    'stock_name': item.get('stock_name', ''),
+                    'close': item.get('close', 0),
+                    'prob': item.get('prob_long', item.get('prob', 0)),
+                    'max_gain': item.get('pred_max', item.get('max_gain', 0)),
+                    'target_price': item.get('close', 0) * (1 + item.get('pred_max', 0)),
+                })
+            short_list = []
+            for item in data.get('short', []):
+                short_list.append({
+                    'stock_id': item.get('stock_id', ''),
+                    'stock_name': item.get('stock_name', ''),
+                    'close': item.get('close', 0),
+                    'prob': item.get('prob_short', item.get('prob', 0)),
+                    'max_loss': item.get('pred_min', item.get('max_loss', 0)),
+                    'target_price': item.get('close', 0) * (1 + item.get('pred_min', 0)),
+                })
+            data = {'long_top10': long_list, 'short_top10': short_list, 'date': data.get('date', date_str)}
+
+        return data
+
+
 
     def _save_predictions(self, date_str: str, data: Dict):
         """Save predictions to history."""
@@ -584,9 +669,15 @@ class PredictEngine:
                 last_close = price_df['close'].values[-1]
                 stock_name = self._get_stock_name(stock_id)
 
-                # Long model prediction
+            except Exception as e:
+                logger.error("Error fetching/prep data for %s: %s", stock_id, e)
+                continue
+
+            # Long model prediction (independent of short model)
+            try:
                 X_long = pd.DataFrame([feat_long])[FEATURES_LONG]
-                long_prob = self.model_long.predict_proba(X_long)[0][1]
+                # LightGBM Booster.predict() returns 1D array of probabilities
+                long_prob = self.model_long.predict(X_long)[0]
 
                 # Regression for max gain
                 future_max_pct = 0.0
@@ -601,10 +692,14 @@ class PredictEngine:
                     'max_gain': future_max_pct,
                     'target_price': last_close * (1 + future_max_pct),
                 })
+            except Exception as e:
+                logger.error("Long prediction failed for %s: %s", stock_id, e, exc_info=True)
 
-                # Short model prediction
+            # Short model prediction (independent of long model)
+            try:
                 X_short = pd.DataFrame([feat_short])[FEATURES_SHORT]
-                short_prob = self.model_short.predict_proba(X_short)[0][1]
+                # LightGBM Booster.predict() returns 1D array of probabilities
+                short_prob = self.model_short.predict(X_short)[0]
 
                 # Regression for max loss
                 future_min_pct = 0.0
@@ -619,10 +714,8 @@ class PredictEngine:
                     'max_loss': future_min_pct,
                     'target_price': last_close * (1 + future_min_pct),
                 })
-
             except Exception as e:
-                logger.error("Error processing %s: %s", stock_id, e)
-                continue
+                logger.error("Short prediction failed for %s: %s", stock_id, e, exc_info=True)
 
         if not long_results and not short_results:
             logger.error("No valid predictions generated")
@@ -739,7 +832,7 @@ class PredictEngine:
                 'pred_gain': item['max_gain'],
                 'actual_max_gain': actual_gain,
                 'actual_return': (actual_close - pred_close) / pred_close,
-                'hit': actual_gain >= 0.05,  # 5% gain threshold
+                'hit': bool(actual_gain >= 0.05),  # 5% gain threshold
             })
 
         # Review short predictions
@@ -762,7 +855,7 @@ class PredictEngine:
                 'pred_loss': item['max_loss'],
                 'actual_max_loss': actual_loss,
                 'actual_return': (actual_close - pred_close) / pred_close,
-                'hit': actual_loss <= -0.05,  # 5% drop threshold
+                'hit': bool(actual_loss <= -0.05),  # 5% drop threshold
             })
 
         # Compute hit rates
@@ -774,14 +867,41 @@ class PredictEngine:
         review_results['long_hit_rate'] = long_hits / long_total if long_total > 0 else 0
         review_results['short_hit_rate'] = short_hits / short_total if short_total > 0 else 0
 
-        # Save review
-        review_path = PREDICTION_HISTORY_DIR / f"review_{prediction_date}.json"
-        with open(review_path, 'w', encoding='utf-8') as f:
-            json.dump(review_results, f, ensure_ascii=False, indent=2)
+        # Save review as Excel
+        review_path = PREDICTION_HISTORY_DIR / f"review_{prediction_date}.xlsx"
+        wb = Workbook()
+        # Sheet 1: 做多檢核
+        ws_long = wb.active
+        ws_long.title = '做多檢核'
+        ws_long.append(['代號', '名稱', '預測機率', '預測漲幅', '實際最高漲幅', '實際報酬', '命中'])
+        for r in review_results['long_review']:
+            ws_long.append([
+                r['stock_id'], r['stock_name'],
+                f"{r['pred_prob']:.1%}", f"{r['pred_gain']:.1%}",
+                f"{r['actual_max_gain']:.1%}", f"{r['actual_return']:.1%}",
+                '✅' if r['hit'] else '❌',
+            ])
+        ws_long.append([])
+        ws_long.append([f'命中率: {long_hits}/{long_total}'])
 
+        # Sheet 2: 做空檢核
+        ws_short = wb.create_sheet('做空檢核')
+        ws_short.append(['代號', '名稱', '預測機率', '預測跌幅', '實際最大跌幅', '實際報酬', '命中'])
+        for r in review_results['short_review']:
+            ws_short.append([
+                r['stock_id'], r['stock_name'],
+                f"{r['pred_prob']:.1%}", f"{r['pred_loss']:.1%}",
+                f"{r['actual_max_loss']:.1%}", f"{r['actual_return']:.1%}",
+                '✅' if r['hit'] else '❌',
+            ])
+        ws_short.append([])
+        ws_short.append([f'命中率: {short_hits}/{short_total}'])
+
+        wb.save(review_path)
         logger.info("Review complete for %s: long hit=%d/%d, short hit=%d/%d",
                     prediction_date, long_hits, long_total, short_hits, short_total)
-        return review_results
+        return review_path
+
 
     # ------------------------------------------------------------------
     # Backfill
