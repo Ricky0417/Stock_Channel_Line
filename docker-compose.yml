@@ -1,0 +1,12 @@
+services:
+  stock-channel-bot:
+    build: .
+    container_name: stock-channel-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./model:/app/model
+    environment:
+      - TZ=Asia/Taipei
