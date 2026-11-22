@@ -277,19 +277,36 @@ class PredictEngine:
     # Top 300 Stocks
     # ------------------------------------------------------------------
     def _get_top300(self, end_date: str) -> List[str]:
-        """Get top 300 stocks by recent trading volume."""
-        start = (pd.Timestamp(end_date) - timedelta(days=10)).strftime('%Y-%m-%d')
-        params = {
-            'dataset': 'TaiwanStockPrice',
-            'start_date': start,
-            'end_date': end_date,
-            'token': self.token,
-        }
-        df = self._api_get(params)
-        if df is None or len(df) == 0:
+        """Get top 300 stocks by recent trading volume.
+
+        NOTE: FinMind's TaiwanStockPrice dataset only returns full-market
+        data (all stock_id) when queried for a SINGLE date (start_date ==
+        end_date). A date-range query without data_id silently returns an
+        empty result set even though status==200. So we must fetch each
+        calendar day individually and concatenate, rather than requesting
+        a single range covering the last 10 days.
+        """
+        dates = pd.date_range(
+            end=end_date, periods=10, freq='D'
+        ).strftime('%Y-%m-%d').tolist()
+
+        frames = []
+        for d in dates:
+            params = {
+                'dataset': 'TaiwanStockPrice',
+                'start_date': d,
+                'end_date': d,
+                'token': self.token,
+            }
+            day_df = self._api_get(params)
+            if day_df is not None and len(day_df) > 0:
+                frames.append(day_df)
+
+        if not frames:
             logger.warning("Cannot get top 300 stocks")
             return []
 
+        df = pd.concat(frames, ignore_index=True)
         df['Trading_Volume'] = pd.to_numeric(df['Trading_Volume'], errors='coerce').fillna(0)
         vol_sum = df.groupby('stock_id')['Trading_Volume'].sum().reset_index()
         vol_sum = vol_sum.sort_values('Trading_Volume', ascending=False)
@@ -570,9 +587,11 @@ class PredictEngine:
         if 'long_top10' not in data and 'long' in data:
             long_list = []
             for item in data.get('long', []):
+                sid = item.get('stock_id', '')
+                nm = item.get('stock_name', '') or self._get_stock_name(sid)
                 long_list.append({
-                    'stock_id': item.get('stock_id', ''),
-                    'stock_name': item.get('stock_name', ''),
+                    'stock_id': sid,
+                    'stock_name': nm,
                     'close': item.get('close', 0),
                     'prob': item.get('prob_long', item.get('prob', 0)),
                     'max_gain': item.get('pred_max', item.get('max_gain', 0)),
@@ -580,15 +599,23 @@ class PredictEngine:
                 })
             short_list = []
             for item in data.get('short', []):
+                sid = item.get('stock_id', '')
+                nm = item.get('stock_name', '') or self._get_stock_name(sid)
                 short_list.append({
-                    'stock_id': item.get('stock_id', ''),
-                    'stock_name': item.get('stock_name', ''),
+                    'stock_id': sid,
+                    'stock_name': nm,
                     'close': item.get('close', 0),
                     'prob': item.get('prob_short', item.get('prob', 0)),
                     'max_loss': item.get('pred_min', item.get('max_loss', 0)),
                     'target_price': item.get('close', 0) * (1 + item.get('pred_min', 0)),
                 })
             data = {'long_top10': long_list, 'short_top10': short_list, 'date': data.get('date', date_str)}
+        else:
+            # 新格式：若名稱缺失也補上
+            for key in ('long_top10', 'short_top10'):
+                for item in data.get(key, []):
+                    if not item.get('stock_name'):
+                        item['stock_name'] = self._get_stock_name(item.get('stock_id', ''))
 
         return data
 
@@ -825,14 +852,18 @@ class PredictEngine:
             actual_close = price_df['close'].values[-1]
             actual_gain = (actual_max - pred_close) / pred_close
 
+            # 命中判定：實際最高漲幅 >= 預測漲幅的 70%（至少 3% 地板，避免預測值過小時失真）
+            pred_gain = item['max_gain']
+            hit_target = max(pred_gain * 0.70, 0.03)
             review_results['long_review'].append({
                 'stock_id': stock_id,
                 'stock_name': item['stock_name'],
                 'pred_prob': item['prob'],
-                'pred_gain': item['max_gain'],
+                'pred_gain': pred_gain,
                 'actual_max_gain': actual_gain,
                 'actual_return': (actual_close - pred_close) / pred_close,
-                'hit': bool(actual_gain >= 0.05),  # 5% gain threshold
+                'hit_target': hit_target,
+                'hit': bool(actual_gain >= hit_target),
             })
 
         # Review short predictions
@@ -848,14 +879,18 @@ class PredictEngine:
             actual_close = price_df['close'].values[-1]
             actual_loss = (actual_min - pred_close) / pred_close
 
+            # 命中判定：實際最大跌幅 <= 預測跌幅的 70%（跌幅為負值，取更負者；至少 -3% 地板）
+            pred_loss = item['max_loss']
+            hit_target = min(pred_loss * 0.70, -0.03)
             review_results['short_review'].append({
                 'stock_id': stock_id,
                 'stock_name': item['stock_name'],
                 'pred_prob': item['prob'],
-                'pred_loss': item['max_loss'],
+                'pred_loss': pred_loss,
                 'actual_max_loss': actual_loss,
                 'actual_return': (actual_close - pred_close) / pred_close,
-                'hit': bool(actual_loss <= -0.05),  # 5% drop threshold
+                'hit_target': hit_target,
+                'hit': bool(actual_loss <= hit_target),
             })
 
         # Compute hit rates
@@ -873,11 +908,12 @@ class PredictEngine:
         # Sheet 1: 做多檢核
         ws_long = wb.active
         ws_long.title = '做多檢核'
-        ws_long.append(['代號', '名稱', '預測機率', '預測漲幅', '實際最高漲幅', '實際報酬', '命中'])
+        ws_long.append(['代號', '名稱', '預測機率', '預測漲幅', '命中門檻', '實際最高漲幅', '實際報酬', '命中'])
         for r in review_results['long_review']:
             ws_long.append([
                 r['stock_id'], r['stock_name'],
                 f"{r['pred_prob']:.1%}", f"{r['pred_gain']:.1%}",
+                f"{r['hit_target']:.1%}",
                 f"{r['actual_max_gain']:.1%}", f"{r['actual_return']:.1%}",
                 '✅' if r['hit'] else '❌',
             ])
@@ -886,11 +922,12 @@ class PredictEngine:
 
         # Sheet 2: 做空檢核
         ws_short = wb.create_sheet('做空檢核')
-        ws_short.append(['代號', '名稱', '預測機率', '預測跌幅', '實際最大跌幅', '實際報酬', '命中'])
+        ws_short.append(['代號', '名稱', '預測機率', '預測跌幅', '命中門檻', '實際最大跌幅', '實際報酬', '命中'])
         for r in review_results['short_review']:
             ws_short.append([
                 r['stock_id'], r['stock_name'],
                 f"{r['pred_prob']:.1%}", f"{r['pred_loss']:.1%}",
+                f"{r['hit_target']:.1%}",
                 f"{r['actual_max_loss']:.1%}", f"{r['actual_return']:.1%}",
                 '✅' if r['hit'] else '❌',
             ])

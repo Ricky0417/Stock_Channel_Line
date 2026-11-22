@@ -1,4 +1,5 @@
 services:
+  # ── 原本的 TG bot：完全沒動 ─────────────────────────────────────────────
   stock-channel-bot:
     build: .
     container_name: stock-channel-bot
@@ -10,3 +11,32 @@ services:
       - ./model:/app/model
     environment:
       - TZ=Asia/Taipei
+
+  # ── 新增：每日名單（predict_v2 + stock_model_v12）─────────────────────
+  # 跟 bot 共用同一個 image，只是換 command。bot.py 一行都沒改。
+  #
+  # Telegram 推送是直接打 api.telegram.org，不經過 bot.py，只共用 BOT_TOKEN。
+  #
+  # 為什麼要多掛 .cache_live：
+  #   predict_v2 自己管一套增量快取（每個 資料集×股票 一個 parquet）。
+  #   沒掛出來的話容器一重啟就要重建 —— 約 2200 次 API、20 分鐘。
+  #   這個漏掉不會報錯，只會安靜地每次重啟都變慢。
+  picker:
+    build: .
+    container_name: stock-picker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data           # 跟 bot 同一個，compare_review 才看得到兩份名單
+      - ./model:/app/model         # stock_model_v12.pkl 在這
+      - ./.cache_live:/app/.cache_live
+    environment:
+      - TZ=Asia/Taipei
+    command: >
+      python predict_v2.py
+      --daemon
+      --at 18:30
+      --telegram
+      --model model/stock_model_v12.pkl
+      --max-per-hour 4800

@@ -21,5 +21,8 @@ COPY *.py .
 
 # Create data directory for watchlist persistence
 RUN mkdir -p /app/data
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir pyarrow
 
 CMD ["python", "bot.py"]
